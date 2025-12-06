@@ -1,0 +1,198 @@
+name: 'Publish: Package'
+
+on:
+  workflow_call:
+    inputs:
+      publish-dry:
+        description: 'Publish: Dry-run'
+        type: boolean
+        default: true
+        required: false
+      provenance:
+        description: 'Publish: Provenance'
+        type: boolean
+        default: true
+        required: false
+      registry:
+        description: 'Publish: Registry'
+        type: string
+        default: 'https://registry.npmjs.org'
+        required: false
+      artifact:
+        description: 'Artifact: Name'
+        type: string
+        default: 'hashlock-pkg-main'
+        required: false
+      package-name:
+        description: 'Package: Name Override'
+        type: string
+        default: ''
+        required: false
+      package-version:
+        description: 'Package: Version Override'
+        type: string
+        default: ''
+        required: false
+      tag:
+        description: 'Publish: Tag'
+        type: string
+        default: 'latest'
+        required: false
+      environment:
+        description: 'Publish: Environment'
+        type: string
+        default: 'npm'
+        required: false
+    secrets:
+      PUBLISH_TOKEN:
+        description: 'Publishing Token'
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      publish-dry:
+        description: 'Publish: Dry-run'
+        type: boolean
+        default: true
+      provenance:
+        description: 'Publish: Provenance'
+        type: boolean
+        default: true
+      registry:
+        description: 'Publish: Registry'
+        type: choice
+        default: 'https://registry.npmjs.org'
+        options:
+          - 'https://registry.npmjs.org'
+          - 'https://npm.pkg.github.com'
+      artifact:
+        description: 'Artifact: Name'
+        type: string
+        default: 'hashlock-pkg-main'
+      package-name:
+        description: 'Package: Name Override'
+        type: string
+        default: ''
+        required: false
+      package-version:
+        description: 'Package: Version Override'
+        type: string
+        default: ''
+        required: false
+      tag:
+        description: 'Publish: Tag'
+        type: string
+        default: 'latest'
+        required: false
+      environment:
+        description: 'Publish: Environment'
+        type: environment
+        default: npm
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish-package-main:
+    name: 'Publish: Main Package'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    environment:
+      name: ${{ inputs.environment }}
+    outputs:
+      lib: 'main'
+      package: ${{ steps.metadata.outputs.package }}
+      version: ${{ steps.metadata.outputs.version }}
+      registry: ${{ steps.metadata.outputs.registry }}
+    steps:
+      - name: 'Setup: Harden Runner'
+        uses: step-security/harden-runner@0080882f6c36860b6ba35c610c98ce87d4e2f26f # v2.10.2
+        with:
+          disable-sudo: true
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            bun.sh:443
+            fulcio.sigstore.dev:443
+            github.com:443
+            objects.githubusercontent.com:443
+            registry.npmjs.org:443
+            rekor.sigstore.dev:443
+      - name: 'Setup: Checkout'
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: 'Setup: Node'
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version-file: .node-version
+          registry-url: ${{ inputs.registry }}
+      - name: 'Setup: Bun'
+        uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2.0.1
+        with:
+          bun-version: latest
+      - name: 'Setup: PNPM'
+        uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: '8.15.3'
+          run_install: |
+            - args: [--frozen-lockfile, --strict-peer-dependencies]
+      - name: 'NPM: Package Name Override'
+        if: inputs.package-name != ''
+        run: |
+          echo "Overriding package name as '${{ inputs.package-name }}':"
+          cat package.json | jq '.name = "${{ inputs.package-name }}"' | tee package.json | jq
+      - name: 'NPM: Package Version Override'
+        if: inputs.package-version != ''
+        run: |
+          echo "Overriding package name as '${{ inputs.package-version }}':"
+          cat package.json | jq '.name = "${{ inputs.package-version }}"' | tee package.json | jq
+      - name: 'NPM: Metadata'
+        id: metadata
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: |
+          PKG=$(cat package.json | jq .name | sed -e 's/^"//' -e 's/"$//')
+          VERSION=$(cat package.json | jq .version | sed -e 's/^"//' -e 's/"$//')
+          echo "Package: $PKG"
+          echo "Version: $VERSION"
+          echo "package=$PKG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+      - name: 'Build: Bundle'
+        id: build-bundle
+        run: bun --bun run build
+      - name: 'NPM: Pack'
+        run: npm pack
+      - name: 'Check: Token'
+        run: |
+          echo "Checking token..."
+          test -n "$NODE_AUTH_TOKEN"
+          echo "Token SHA1:"
+          echo "$NODE_AUTH_TOKEN" | openssl sha1
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.PUBLISH_TOKEN || github.token }}
+      - name: 'Artifact: Package'
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+        with:
+          name: ${{ inputs.artifact }}
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
+          path: ./*.tgz
+      - name: 'NPM: Publish'
+        run: |
+          npm publish \
+            --dry-run=${{ inputs.publish-dry }} \
+            --access=public \
+            --registry="${{ inputs.registry }}" \
+            --provenance=${{ inputs.provenance }} \
+            --tag="${{ inputs.tag }}" \
+            --token="$NODE_AUTH_TOKEN"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.PUBLISH_TOKEN || github.token }}

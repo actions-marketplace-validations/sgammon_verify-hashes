@@ -1,15 +1,28 @@
+/*
+ * Copyright (c) 2024 Elide Technologies, Inc.
+ *
+ * Licensed under the MIT license (the "License"); you may not use this file except in compliance
+ *  with the License. You may obtain a copy of the License at
+ *
+ *     https://opensource.org/license/mit/
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+ *  an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ *  License for the specific language governing permissions and limitations under the License.
+ */
+
 import { join, resolve, basename, dirname, normalize } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { generateHash } from './generator'
 
-import { glob } from './github'
+import { glob } from 'glob'
 
 import {
   HashVerifierLogger,
   HashVerifierResultsReceiver,
-  createLogger,
-  createReporter
+  createDefaultLogger,
+  createDefaultReporter
 } from './logger'
 
 import {
@@ -30,7 +43,7 @@ import {
   allAlgorithms
 } from './model'
 
-let logging = createLogger()
+let logging: HashVerifierLogger = createDefaultLogger()
 
 /**
  * Hash Verify Error
@@ -313,18 +326,20 @@ export async function readHashFile(file: string): Promise<HashFileContent[]> {
  * @param subject Subject file content to hash and compare with the hashfile content
  * @returns Result of the comparison between the hash file and the hashed subject file content
  */
-export function compareHashWithSubject(
+export async function compareHashWithSubject(
   hash: HashFileContent,
   subject: FileContent
-): VerifyHashFileInfo {
+): Promise<VerifyHashFileInfo> {
   const { algorithm, encoding, hash: expected } = hash
   logging.debug(
     `- Comparing hash for '${subject.file}' (algorithm: ${algorithm}, encoding: ${encoding}, expected: ${expected})`
   )
 
-  const actual: string = createHash(algorithm)
-    .update(subject.contents)
-    .digest(encoding)
+  const actual: string = await generateHash(
+    algorithm,
+    encoding,
+    subject.contents
+  )
   const valid = actual === expected
   logging.debug(
     `- Hash comparison result for '${subject.file}': ${valid ? 'valid' : 'invalid'} (actual: ${actual})`
@@ -376,7 +391,10 @@ export async function verifyHashFile(
     return Promise.all(
       (await readHashFile(abs)).map(async hash => {
         try {
-          return compareHashWithSubject(hash, await readSubject(hash.subject))
+          return await compareHashWithSubject(
+            hash,
+            await readSubject(hash.subject)
+          )
         } catch (err) {
           if (err instanceof HashVerifyErr) {
             return {
@@ -460,7 +478,6 @@ export type CheckHashesResult = {
  * @param strict Whether to fail the action if any verification fails
  * @param ignored Paths to ignore
  * @param globs Whether to treat paths as globs
- * @param followSymbolicLinks Whether to follow symbolic links
  * @param reporter Custom receiver for results; optional.
  * @param logger Custom logger for the action; optional.
  * @returns {Promise<void>} Resolves when the action is complete.
@@ -470,29 +487,23 @@ export default async function checkHashes(
   strict: boolean,
   ignored: string[],
   globs: boolean,
-  followSymbolicLinks: boolean,
   reporter?: HashVerifierResultsReceiver,
   logger?: HashVerifierLogger
 ): Promise<CheckHashesResult> {
-  const reportTo = reporter || createReporter()
+  const reportTo = reporter || createDefaultReporter()
   logging = logger || logging
   let files: string[]
 
   if (globs) {
-    // grab inputs/config for globbing
-    const globOptions = {
-      followSymbolicLinks,
-      matchDirectories: false
-    }
+    const algorithmExts = allAlgorithms.join(',')
 
     // start generating globs
     const patterns = paths
-      .flatMap(path => allAlgorithms.map(hash => `${path}/**/*.${hash}`))
+      .map(path => `${path}/**/*.{${algorithmExts}}`)
       .concat(ignored.map(entry => `!${entry}`))
 
     // prepare globber, start globbing
-    const globber = await glob.create(patterns.join('\n'), globOptions)
-    files = await globber.glob()
+    files = await glob(patterns)
   } else {
     files = paths.filter(path => {
       return !ignored.includes(path)
@@ -533,6 +544,8 @@ export default async function checkHashes(
 
   const verifiedFiles = results.filter(({ valid }) => valid)
   const failedVerifications = results.filter(({ valid }) => !valid)
+  if (verifiedFiles.length > 0)
+    logging.info(`Verified ${verifiedFiles.length} hash files`)
   reportResults(files, verifiedFiles, failedVerifications, errors, reportTo)
   return {
     verifiedFiles,
